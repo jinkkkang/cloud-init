@@ -100,10 +100,6 @@ OSFAMILIES = {
 
 LOG = logging.getLogger(__name__)
 
-# This is a best guess regex, based on current EC2 AZs on 2017-12-11.
-# It could break when Amazon adds new regions and new AZs.
-_EC2_AZ_RE = re.compile("^[a-z][a-z]-(?:[a-z]+-)+[0-9][a-z]$")
-
 # Default NTP Client Configurations
 PREFERRED_NTP_CLIENTS = ["chrony", "systemd-timesyncd", "ntp", "ntpdate"]
 
@@ -349,15 +345,16 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         raise dhcp.NoDHCPLeaseMissingDhclientError()
 
     @property
-    def network_activator(self) -> Optional[Type[activators.NetworkActivator]]:
-        """Return the configured network activator for this environment."""
+    def network_activator(self) -> Type[activators.NetworkActivator]:
+        """Return the configured network activator for this environment.
+
+        :returns: The network activator class to use
+        :raises: NoActivatorException if no activator is found
+        """
         priority = util.get_cfg_by_path(
             self._cfg, ("network", "activators"), None
         )
-        try:
-            return activators.select_activator(priority=priority)
-        except activators.NoActivatorException:
-            return None
+        return activators.select_activator(priority=priority)
 
     @property
     def network_renderer(self) -> Renderer:
@@ -460,8 +457,9 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         # Now try to bring them up
         if bring_up:
             LOG.debug("Bringing up newly configured network interfaces")
-            network_activator = self.network_activator
-            if not network_activator:
+            try:
+                network_activator = self.network_activator
+            except activators.NoActivatorException:
                 LOG.warning(
                     "No network activator found, not bringing up "
                     "network interfaces"
@@ -1574,6 +1572,19 @@ class Distro(persistence.CloudInitPickleMixin, metaclass=abc.ABCMeta):
         # name in /dev/
         return diskdevpath, ptnum
 
+    def wait_for_network(self) -> None:
+        """Ensure that cloud-init has network connectivity.
+
+        For most distros, this is a no-op as cloud-init's network service is
+        ordered in boot to start after network connectivity has been achieved.
+        As an optimization, distros may opt to order cloud-init's network
+        service immediately after cloud-init's local service, and only
+        require network connectivity if it has been deemed necessary.
+        This method is a hook for distros to implement this optimization.
+        It is called during cloud-init's network stage if it was determined
+        that network connectivity is necessary in cloud-init's network stage.
+        """
+
 
 def _apply_hostname_transformations_to_url(url: str, transformations: list):
     """
@@ -1692,7 +1703,12 @@ def _get_package_mirror_info(
 
         # ec2 availability zones are named cc-direction-[0-9][a-d] (us-east-1b)
         # the region is us-east-1. so region = az[0:-1]
-        if _EC2_AZ_RE.match(data_source.availability_zone):
+        # This is a best guess regex, based on current EC2 AZs on 2017-12-11.
+        # It could break when Amazon adds new regions and new AZs.
+        if re.match(
+            "^[a-z][a-z]-(?:[a-z]+-)+[0-9][a-z]$",
+            data_source.availability_zone,
+        ):
             ec2_region = data_source.availability_zone[0:-1]
 
             if ALLOW_EC2_MIRRORS_ON_NON_AWS_INSTANCE_TYPES:
