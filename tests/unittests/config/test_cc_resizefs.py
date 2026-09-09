@@ -1,5 +1,6 @@
 # This file is part of cloud-init. See LICENSE file for license information.
 
+import errno
 import logging
 from collections import namedtuple
 
@@ -13,6 +14,7 @@ from cloudinit.config.cc_resizefs import (
     _resize_xfs,
     _resize_zfs,
     can_skip_resize,
+    do_resize_many,
     get_device_info_from_zpool,
     handle,
     maybe_get_writable_device_path,
@@ -87,6 +89,276 @@ class TestResizefs:
             logging.DEBUG,
             "Skipping module named cc_resizefs, resizing disabled",
         ) in caplog.record_tuples
+
+    def test_handle_resizes_multiple_mount_points(self):
+        mount_info = {
+            "/": ("/dev/sda1", "ext4", "/"),
+            "/data": ("/dev/sdb1", "ext4", "/data"),
+        }
+        cfg = {"resizefs": {"devices": ["/", "/data"]}}
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            side_effect=lambda path, log: mount_info[path],
+        ), mock.patch(
+            M_PATH + "maybe_get_writable_device_path",
+            side_effect=lambda devpath, info: devpath,
+        ), mock.patch(
+            M_PATH + "do_resize"
+        ) as m_resize:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        assert [
+            mock.call(("resize2fs", "/dev/sda1")),
+            mock.call(("resize2fs", "/dev/sdb1")),
+        ] == m_resize.call_args_list
+
+    def test_handle_skips_path_that_is_not_mount_point(self, caplog):
+        cfg = {"resizefs": {"devices": ["/data"]}}
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            return_value=("/dev/sda1", "ext4", "/"),
+        ), mock.patch(M_PATH + "do_resize") as m_resize:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        assert not m_resize.called
+        assert "Resize target '/data' is not a mount point" in caplog.text
+        assert "No filesystem resize commands were generated" in caplog.text
+
+    def test_handle_rejects_parent_path_before_normalizing(self):
+        cfg = {"resizefs": {"devices": ["/missing/.."]}}
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info"
+        ) as m_get_mount_info, mock.patch(M_PATH + "do_resize") as m_resize:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        assert not m_get_mount_info.called
+        assert not m_resize.called
+
+    def test_handle_deduplicates_filesystem_devices(self):
+        mount_info = {
+            "/": ("/dev/sda1", "ext4", "/"),
+            "/bind": ("/dev/sda1", "ext4", "/bind"),
+        }
+        cfg = {"resizefs": {"devices": ["/", "/bind"]}}
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            side_effect=lambda path, log: mount_info[path],
+        ), mock.patch(
+            M_PATH + "maybe_get_writable_device_path",
+            side_effect=lambda devpath, info: devpath,
+        ), mock.patch(
+            M_PATH + "util.mount_is_read_write"
+        ) as m_mount_is_read_write, mock.patch(
+            M_PATH + "do_resize"
+        ) as m_resize:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        m_resize.assert_called_once_with(("resize2fs", "/dev/sda1"))
+        assert not m_mount_is_read_write.called
+
+    @pytest.mark.parametrize("fs_type", ("btrfs", "xfs"))
+    @pytest.mark.parametrize(
+        "devices",
+        (("/readonly", "/writable"), ("/writable", "/readonly")),
+    )
+    def test_handle_prefers_writable_mount(self, fs_type, devices):
+        mount_info = {
+            "/readonly": ("/dev/sda1", fs_type, "/readonly"),
+            "/writable": ("/dev/sda1", fs_type, "/writable"),
+        }
+        cfg = {"resizefs": {"devices": list(devices)}}
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            side_effect=lambda path, log: mount_info[path],
+        ), mock.patch(
+            M_PATH + "maybe_get_writable_device_path",
+            side_effect=lambda devpath, info: devpath,
+        ), mock.patch(
+            M_PATH + "util.mount_is_read_write",
+            side_effect=lambda path: path == "/writable",
+        ), mock.patch(
+            M_PATH + "_get_resize_command", return_value=("resize",)
+        ) as m_get_command, mock.patch(
+            M_PATH + "do_resize"
+        ):
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        m_get_command.assert_called_once_with(
+            fs_type, "/writable", "/dev/sda1"
+        )
+
+    def test_handle_forks_once_for_multiple_filesystems(self):
+        mount_info = {
+            "/": ("/dev/sda1", "ext4", "/"),
+            "/data": ("/dev/sdb1", "ext4", "/data"),
+        }
+        cfg = {
+            "resize_rootfs": "noblock",
+            "resizefs": {"devices": ["/", "/data"]},
+        }
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            side_effect=lambda path, log: mount_info[path],
+        ), mock.patch(
+            M_PATH + "maybe_get_writable_device_path",
+            side_effect=lambda devpath, info: devpath,
+        ), mock.patch(
+            M_PATH + "util.fork_cb"
+        ) as m_fork:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        m_fork.assert_called_once_with(
+            do_resize_many,
+            [
+                ("resize2fs", "/dev/sda1"),
+                ("resize2fs", "/dev/sdb1"),
+            ],
+        )
+
+    def test_handle_continues_after_target_os_error(self):
+        error = OSError(errno.EIO, "Input/output error")
+        mount_info = {
+            "/first": ("/dev/sda1", "ext4", "/first"),
+            "/failed": ("/dev/sdb1", "ext4", "/failed"),
+            "/last": ("/dev/sdc1", "ext4", "/last"),
+        }
+        cfg = {"resizefs": {"devices": ["/first", "/failed", "/last"]}}
+
+        def get_writable_device(devpath, _info):
+            if devpath == "/dev/sdb1":
+                raise error
+            return devpath
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            side_effect=lambda path, log: mount_info[path],
+        ), mock.patch(
+            M_PATH + "maybe_get_writable_device_path",
+            side_effect=get_writable_device,
+        ), mock.patch(
+            M_PATH + "do_resize"
+        ) as m_resize, pytest.raises(
+            OSError
+        ) as raised:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        assert raised.value is error
+        assert [
+            mock.call(("resize2fs", "/dev/sda1")),
+            mock.call(("resize2fs", "/dev/sdc1")),
+        ] == m_resize.call_args_list
+
+    def test_handle_continues_after_resize_command_os_error(self):
+        error = OSError(errno.EACCES, "Permission denied")
+        mount_info = {
+            "/first": ("/dev/sda1", "ext4", "/first"),
+            "/failed": ("/dev/sdb1", "ext4", "/failed"),
+            "/last": ("/dev/sdc1", "ext4", "/last"),
+        }
+        cfg = {"resizefs": {"devices": ["/first", "/failed", "/last"]}}
+        commands = [
+            ("resize", "/dev/sda1"),
+            error,
+            ("resize", "/dev/sdc1"),
+        ]
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            side_effect=lambda path, log: mount_info[path],
+        ), mock.patch(
+            M_PATH + "maybe_get_writable_device_path",
+            side_effect=lambda devpath, info: devpath,
+        ), mock.patch(
+            M_PATH + "_get_resize_command", side_effect=commands
+        ) as m_get_command, mock.patch(
+            M_PATH + "do_resize"
+        ) as m_resize, pytest.raises(
+            OSError
+        ) as raised:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        assert raised.value is error
+        assert [
+            mock.call("ext4", "/first", "/dev/sda1"),
+            mock.call("ext4", "/failed", "/dev/sdb1"),
+            mock.call("ext4", "/last", "/dev/sdc1"),
+        ] == m_get_command.call_args_list
+        assert [
+            mock.call(("resize", "/dev/sda1")),
+            mock.call(("resize", "/dev/sdc1")),
+        ] == m_resize.call_args_list
+
+    def test_handle_noblock_forks_valid_targets_before_os_error(self):
+        error = OSError(errno.EIO, "Input/output error")
+        mount_info = {
+            "/first": ("/dev/sda1", "ext4", "/first"),
+            "/failed": ("/dev/sdb1", "ext4", "/failed"),
+            "/last": ("/dev/sdc1", "ext4", "/last"),
+        }
+        cfg = {
+            "resize_rootfs": "noblock",
+            "resizefs": {"devices": ["/first", "/failed", "/last"]},
+        }
+
+        def get_writable_device(devpath, _info):
+            if devpath == "/dev/sdb1":
+                raise error
+            return devpath
+
+        with mock.patch(
+            M_PATH + "util.get_mount_info",
+            side_effect=lambda path, log: mount_info[path],
+        ), mock.patch(
+            M_PATH + "maybe_get_writable_device_path",
+            side_effect=get_writable_device,
+        ), mock.patch(
+            M_PATH + "util.fork_cb"
+        ) as m_fork, pytest.raises(
+            OSError
+        ) as raised:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        assert raised.value is error
+        m_fork.assert_called_once_with(
+            do_resize_many,
+            [
+                ("resize2fs", "/dev/sda1"),
+                ("resize2fs", "/dev/sdc1"),
+            ],
+        )
+
+    def test_handle_does_not_hide_unexpected_prepare_error(self):
+        error = RuntimeError("unexpected error")
+        cfg = {"resizefs": {"devices": ["/"]}}
+
+        with mock.patch(
+            M_PATH + "_get_resize_target", side_effect=error
+        ), pytest.raises(RuntimeError) as raised:
+            handle("cc_resizefs", cfg, cloud=None, args=[])
+
+        assert raised.value is error
+
+    def test_do_resize_many_continues_after_failure(self):
+        error = ProcessExecutionError(exit_code=1)
+        commands = [
+            ("resize2fs", "/dev/sda1"),
+            ("resize2fs", "/dev/sdb1"),
+        ]
+
+        with mock.patch(
+            M_PATH + "do_resize", side_effect=[error, None]
+        ) as m_resize, pytest.raises(ProcessExecutionError):
+            do_resize_many(commands)
+
+        assert [mock.call(command) for command in commands] == (
+            m_resize.call_args_list
+        )
 
     @mock.patch("cloudinit.config.cc_resizefs.util.get_mount_info")
     @mock.patch("cloudinit.config.cc_resizefs.LOG")
@@ -527,9 +799,18 @@ class TestResizefsSchema:
         "config, error_msg",
         [
             ({"resize_rootfs": True}, None),
+            ({"resizefs": {"devices": ["/", "/data"]}}, None),
             (
                 {"resize_rootfs": "wrong"},
                 r"'wrong' is not one of \[True, False, 'noblock'\]",
+            ),
+            (
+                {"resizefs": {"devices": ["data"]}},
+                "does not match",
+            ),
+            (
+                {"resizefs": {"unknown": True}},
+                "Additional properties are not allowed",
             ),
         ],
     )

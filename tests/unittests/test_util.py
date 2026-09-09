@@ -400,6 +400,18 @@ class TestUtil:
         result = util.parse_mount_info("/", MOUNT_INFO, LOG, True)
         assert ("/dev/sda1", "btrfs", "/", "ro,relatime") == result
 
+    def test_parse_mtab_unescapes_device_and_mount_point(self):
+        mtab = (
+            "/dev/disk/by-label/data\\040disk /mnt/data\\040drive ext4 rw 0 0"
+        )
+        with mock.patch(M_PATH + "load_text_file", return_value=mtab):
+            result = util.parse_mtab("/mnt/data drive")
+        assert (
+            "/dev/disk/by-label/data disk",
+            "ext4",
+            "/mnt/data drive",
+        ) == result
+
     @pytest.mark.parametrize(
         "opt, expected_result",
         [
@@ -2162,6 +2174,19 @@ class TestMountinfoParsing:
                 expected = ("/dev/mapper/vg0-root", "ext4", "/")
             assert expected == util.parse_mount_info("/", lines)
 
+    def test_unescapes_device_and_mount_point(self):
+        lines = [
+            (
+                "36 29 8:1 / /mnt/data\\040drive rw,relatime - ext4 "
+                "/dev/disk/by-label/data\\040disk rw"
+            )
+        ]
+        assert (
+            "/dev/disk/by-label/data disk",
+            "ext4",
+            "/mnt/data drive",
+        ) == util.parse_mount_info("/mnt/data drive", lines)
+
     def test_precise_ext4_root(self):
         lines = helpers.readResource("mountinfo_precise_ext4.txt").splitlines()
 
@@ -2238,6 +2263,23 @@ class TestMountinfoParsing:
         # this one does not exist in mount_parse_ext.txt
         ret = util.parse_mount("/var/tmp/cloud-init")
         assert ("vmzroot/var/tmp", "zfs", "/var/tmp") == ret
+
+    @mock.patch("cloudinit.subp.subp")
+    def test_parse_mount_preserves_literal_backslash_sequences(
+        self, mount_out
+    ):
+        mount_output = (
+            "/dev/da0p1 on / (ufs, local)\n"
+            r"/dev/da1p1\040data on /mnt/data\040disk (ufs, local)"
+            "\n"
+        )
+        mount_out.return_value = (mount_output, "")
+
+        assert (
+            r"/dev/da1p1\040data",
+            "ufs",
+            r"/mnt/data\040disk",
+        ) == util.parse_mount(r"/mnt/data\040disk")
 
 
 class TestIsX86:

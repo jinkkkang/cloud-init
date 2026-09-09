@@ -200,12 +200,15 @@ class Distro(distros.Distro):
                 # Check if the file system is read only
                 mounts = util.load_text_file("/proc/mounts").split("\n")
                 for mount in mounts:
-                    if mount.startswith(devpth):
-                        mount_info = mount.split()
-                        if mount_info[1] != mount_point:
-                            continue
-                        self.read_only_root = mount_info[3].startswith("ro")
-                        break
+                    mount_info = mount.split()
+                    if len(mount_info) < 4:
+                        continue
+                    mounted_device = util.unescape_fstab_field(mount_info[0])
+                    mounted_at = util.unescape_fstab_field(mount_info[1])
+                    if mounted_device != devpth or mounted_at != mount_point:
+                        continue
+                    self.read_only_root = "ro" in mount_info[3].split(",")
+                    break
                 if fs_type.lower() == "btrfs" and os.path.exists(
                     "/usr/sbin/transactional-update"
                 ):

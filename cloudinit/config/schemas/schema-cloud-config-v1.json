@@ -2572,7 +2572,24 @@
             false,
             "noblock"
           ],
-          "description": "Whether to resize the root partition. ``noblock`` will resize in the background. Default: ``true``."
+          "description": "Whether to resize the configured filesystems. ``noblock`` will resize in the background. Default: ``true``."
+        },
+        "resizefs": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "devices": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^/"
+              },
+              "default": [
+                "/"
+              ],
+              "description": "A list of mounted filesystems to resize. Each entry must be an absolute mount point. Default: ``[/]``."
+            }
+          }
         }
       }
     },
@@ -4252,6 +4269,7 @@
     "random_seed": {},
     "reporting": {},
     "resize_rootfs": {},
+    "resizefs": {},
     "resolv_conf": {},
     "rh_subscription": {},
     "rpi": {},

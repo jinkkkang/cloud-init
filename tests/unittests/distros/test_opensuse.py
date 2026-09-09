@@ -267,6 +267,60 @@ class TestPackageCommands:
 
     @mock.patch(
         "cloudinit.distros.opensuse.util.get_mount_info",
+        return_value=("server:/export/root disk", "xfs", "/"),
+    )
+    @mock.patch(
+        "cloudinit.distros.opensuse.util.load_text_file",
+        return_value=(
+            "malformed\n"
+            "server:/export/root\\040disk / xfs relatime,ro 0 0\n"
+        ),
+    )
+    @mock.patch(
+        "cloudinit.distros.opensuse.os.path.exists", return_value=False
+    )
+    def test_upgrade_detects_encoded_read_only_root(
+        self, m_tu_path, m_mounts, m_minfo, m_subp
+    ):
+        self.distro.update_method = None
+        self.distro.read_only_root = False
+
+        result = self.distro.package_command("upgrade")
+
+        assert self.distro.read_only_root
+        assert result is None
+        assert not m_subp.called
+
+    @mock.patch(
+        "cloudinit.distros.opensuse.util.get_mount_info",
+        return_value=("/dev/sda1", "xfs", "/"),
+    )
+    @mock.patch(
+        "cloudinit.distros.opensuse.util.load_text_file",
+        return_value=(
+            "malformed\n"
+            "/dev/sda10 / xfs ro,relatime 0 0\n"
+            "/dev/sda1 / xfs rootflags,rw 0 0\n"
+        ),
+    )
+    @mock.patch(
+        "cloudinit.distros.opensuse.os.path.exists", return_value=False
+    )
+    def test_upgrade_uses_exact_mount_fields(
+        self, m_tu_path, m_mounts, m_minfo, m_subp
+    ):
+        self.distro.update_method = None
+        self.distro.read_only_root = False
+
+        self.distro.package_command("upgrade")
+
+        assert self.distro.read_only_root is False
+        m_subp.assert_called_once_with(
+            ["zypper", "--non-interactive", "update"], capture=False
+        )
+
+    @mock.patch(
+        "cloudinit.distros.opensuse.util.get_mount_info",
         return_value=("/dev/sda1", "btrfs", "/"),
     )
     @mock.patch(

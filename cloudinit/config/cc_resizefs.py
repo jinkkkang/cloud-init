@@ -248,6 +248,131 @@ def maybe_get_writable_device_path(devpath, info):
     return devpath  # The writable block devpath
 
 
+def _get_resize_target(resize_what):
+    if (
+        not isinstance(resize_what, str)
+        or not os.path.isabs(resize_what)
+        or any(part in (".", "..") for part in resize_what.split(os.sep))
+    ):
+        LOG.warning(
+            "Resize target must be an absolute mount point: %s", resize_what
+        )
+        return None
+
+    resize_what = os.path.normpath(resize_what)
+    result = util.get_mount_info(resize_what, LOG)
+    if not result:
+        LOG.warning("Could not determine filesystem type of %s", resize_what)
+        return None
+
+    devpth, fs_type, mount_point = result
+    if os.path.normpath(mount_point) != resize_what:
+        LOG.warning(
+            "Resize target '%s' is not a mount point; nearest mount point "
+            "is '%s'",
+            resize_what,
+            mount_point,
+        )
+        return None
+
+    identity = None
+    if fs_type == "zfs":
+        zpool = devpth.split("/")[0]
+        devpth = get_device_info_from_zpool(zpool)
+        if not devpth:
+            return None
+        resize_what = zpool
+        identity = ("zfs", zpool)
+
+    info = "dev=%s mnt_point=%s path=%s" % (devpth, mount_point, resize_what)
+    LOG.debug("resize_info: %s", info)
+
+    devpth = maybe_get_writable_device_path(devpth, info)
+    if not devpth:
+        return None
+
+    if identity is None:
+        identity_dev = (
+            os.path.realpath(devpth) if devpth.startswith("/") else devpth
+        )
+        identity = (fs_type.lower(), identity_dev)
+
+    return identity, fs_type, resize_what, devpth
+
+
+def _get_resize_command(fs_type, resize_what, devpth):
+    if can_skip_resize(fs_type, resize_what, devpth):
+        LOG.debug(
+            "Skip resize filesystem type %s for %s", fs_type, resize_what
+        )
+        return None
+
+    fstype_lc = fs_type.lower()
+    for pfix, resizer in RESIZE_FS_PREFIXES_CMDS:
+        if fstype_lc.startswith(pfix):
+            resize_cmd = resizer(resize_what, devpth)
+            LOG.debug(
+                "Resizing %s (%s) using %s",
+                resize_what,
+                fs_type,
+                " ".join(resize_cmd),
+            )
+            return resize_cmd
+
+    LOG.warning(
+        "Not resizing unknown filesystem type %s for %s",
+        fs_type,
+        resize_what,
+    )
+    return None
+
+
+def _get_resize_commands(devices):
+    targets = {}
+    failures = []
+
+    for entry in devices:
+        try:
+            target = _get_resize_target(entry)
+            if not target:
+                continue
+            identity, fs_type, resize_what, devpth = target
+            existing = targets.get(identity)
+            if existing:
+                _, _, existing_resize_what, _ = existing
+                prefer_target = (
+                    fs_type.lower().startswith(("btrfs", "xfs"))
+                    and not util.mount_is_read_write(existing_resize_what)
+                    and util.mount_is_read_write(resize_what)
+                )
+                if not prefer_target:
+                    LOG.debug(
+                        "Skipping duplicate filesystem resize target: %s",
+                        entry,
+                    )
+                    continue
+            targets[identity] = (entry, fs_type, resize_what, devpth)
+        except OSError as e:
+            util.logexc(
+                LOG, "Failed to prepare filesystem resize for %s", entry
+            )
+            failures.append(e)
+
+    commands = []
+    for entry, fs_type, resize_what, devpth in targets.values():
+        try:
+            resize_cmd = _get_resize_command(fs_type, resize_what, devpth)
+            if resize_cmd:
+                commands.append(resize_cmd)
+        except OSError as e:
+            util.logexc(
+                LOG, "Failed to prepare filesystem resize for %s", entry
+            )
+            failures.append(e)
+
+    return commands, failures
+
+
 def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
     if args:
         resize_root = args[0]
@@ -257,75 +382,57 @@ def handle(name: str, cfg: Config, cloud: Cloud, args: list) -> None:
         LOG.debug("Skipping module named %s, resizing disabled", name)
         return
 
-    # TODO(harlowja): allow what is to be resized to be configurable??
-    resize_what = "/"
-    result = util.get_mount_info(resize_what, LOG)
-    if not result:
-        LOG.warning("Could not determine filesystem type of %s", resize_what)
+    resize_cfg = cfg.get("resizefs", {})
+    if not isinstance(resize_cfg, dict):
+        LOG.warning("'resizefs' in config was not a dict")
         return
 
-    devpth, fs_type, mount_point = result
-
-    # if we have a zfs then our device path at this point
-    # is the zfs label. For example: vmzroot/ROOT/freebsd
-    # we will have to get the zpool name out of this
-    # and set the resize_what variable to the zpool
-    # so the _resize_zfs function gets the right attribute.
-    if fs_type == "zfs":
-        zpool = devpth.split("/")[0]
-        devpth = get_device_info_from_zpool(zpool)
-        if not devpth:
-            return  # could not find device from zpool
-        resize_what = zpool
-
-    info = "dev=%s mnt_point=%s path=%s" % (devpth, mount_point, resize_what)
-    LOG.debug("resize_info: %s", info)
-
-    devpth = maybe_get_writable_device_path(devpth, info)
-    if not devpth:
-        return  # devpath was not a writable block device
-
-    resizer = None
-    if can_skip_resize(fs_type, resize_what, devpth):
-        LOG.debug(
-            "Skip resize filesystem type %s for %s", fs_type, resize_what
-        )
+    devices = util.get_cfg_option_list(resize_cfg, "devices", ["/"])
+    if not devices:
+        LOG.debug("resizefs: empty device list")
         return
 
-    fstype_lc = fs_type.lower()
-    for pfix, root_cmd in RESIZE_FS_PREFIXES_CMDS:
-        if fstype_lc.startswith(pfix):
-            resizer = root_cmd
-            break
-
-    if not resizer:
-        LOG.warning(
-            "Not resizing unknown filesystem type %s for %s",
-            fs_type,
-            resize_what,
-        )
+    resize_commands, failures = _get_resize_commands(devices)
+    if not resize_commands:
+        if failures:
+            raise failures[0]
+        LOG.debug("No filesystem resize commands were generated")
         return
-
-    resize_cmd = resizer(resize_what, devpth)
-    LOG.debug(
-        "Resizing %s (%s) using %s", resize_what, fs_type, " ".join(resize_cmd)
-    )
 
     if resize_root == NOBLOCK:
-        # Fork to a child that will run
-        # the resize command
-        util.fork_cb(
-            do_resize,
-            resize_cmd,
-        )
+        if len(resize_commands) == 1:
+            util.fork_cb(do_resize, resize_commands[0])
+        else:
+            util.fork_cb(do_resize_many, resize_commands)
     else:
-        do_resize(resize_cmd)
+        try:
+            do_resize_many(resize_commands)
+        except subp.ProcessExecutionError as e:
+            failures.append(e)
+
+    if failures:
+        raise failures[0]
+
     action = "Resized"
     if resize_root == NOBLOCK:
         action = "Resizing (via forking)"
     LOG.debug(
-        "%s root filesystem (type=%s, val=%s)", action, fs_type, resize_root
+        "%s %s filesystem(s) (val=%s)",
+        action,
+        len(resize_commands),
+        resize_root,
     )
+
+
+def do_resize_many(resize_commands):
+    failures = []
+    for resize_cmd in resize_commands:
+        try:
+            do_resize(resize_cmd)
+        except subp.ProcessExecutionError as e:
+            failures.append(e)
+    if failures:
+        raise failures[0]
 
 
 def do_resize(resize_cmd):

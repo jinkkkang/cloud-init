@@ -220,13 +220,13 @@ locale: en_US.UTF-8
 # render template default-locale.tmpl to locale_configfile
 locale_configfile: /etc/default/locale
 
-# resize_rootfs should the / filesystem be resized on first boot
-# this allows you to launch an instance with a larger disk / partition
-# and have the instance automatically grow / to accomoddate it
-# set to 'False' to disable
-# by default, the resizefs is done early in boot, and blocks
-# if resize_rootfs is set to 'noblock', then it will be run in parallel
+# resize_rootfs controls whether configured filesystems are resized on boot
+# set to 'False' to disable or 'noblock' to resize in the background
 resize_rootfs: True
+# resizefs devices must be absolute mount points that are already mounted
+resizefs:
+  devices:
+    - /
 
 ## hostname and /etc/hosts management
 # cloud-init can handle updating some entries in /etc/hosts,

@@ -2581,7 +2581,7 @@ def parse_mount_info(path, mountinfo_lines, log=LOG, get_mnt_opts=False):
             )
             return None
 
-        mount_point = parts[4]
+        mount_point = unescape_fstab_field(parts[4])
         mount_point_elements = [e for e in mount_point.split("/") if e]
 
         # Ignore mounts deeper than the path in question.
@@ -2614,7 +2614,7 @@ def parse_mount_info(path, mountinfo_lines, log=LOG, get_mnt_opts=False):
         # Get the path to the device.
         try:
             fs_type = parts[i + 1]
-            devpth = parts[i + 2]
+            devpth = unescape_fstab_field(parts[i + 2])
         except IndexError:
             log.debug(
                 "Too few columns after '-' column in line %d: %s", i + 1, line
@@ -2639,6 +2639,8 @@ def parse_mtab(path):
     """On older kernels there's no /proc/$$/mountinfo, so use mtab."""
     for line in load_text_file("/etc/mtab").splitlines():
         devpth, mount_point, fs_type = line.split()[:3]
+        devpth = unescape_fstab_field(devpth)
+        mount_point = unescape_fstab_field(mount_point)
         if mount_point == path:
             return devpth, fs_type, mount_point
     return None
